@@ -1,7 +1,7 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -249,6 +249,74 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+// ── Widget management ──
+
+/** Latest ExtensionContext from session_start, used for widget updates. */
+let latestCtx: ExtensionContext | null = null;
+
+/** Interval timer for widget re-renders. */
+let widgetInterval: ReturnType<typeof setInterval> | null = null;
+
+function formatElapsedMMSS(startTime: number): string {
+  const seconds = Math.floor((Date.now() - startTime) / 1000);
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function updateWidget() {
+  if (!latestCtx?.hasUI) return;
+
+  if (runningSubagents.size === 0) {
+    latestCtx.ui.setWidget("subagent-status", undefined);
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    return;
+  }
+
+  latestCtx.ui.setWidget(
+    "subagent-status",
+    (_tui: any, theme: any) => {
+      const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
+
+      const count = runningSubagents.size;
+      const header =
+        theme.fg("dim", "─ Subagents ") +
+        theme.fg("accent", `${count} running`) +
+        theme.fg("dim", " ─");
+
+      const agentLines: string[] = [];
+      for (const [_id, agent] of runningSubagents) {
+        const elapsed = formatElapsedMMSS(agent.startTime);
+        const agentTag = agent.agent ? theme.fg("dim", ` (${agent.agent})`) : "";
+        const progress =
+          agent.entries != null && agent.bytes != null
+            ? theme.fg("dim", `${agent.entries} msgs (${formatBytes(agent.bytes)})`)
+            : theme.fg("dim", "loading…");
+
+        agentLines.push(
+          `  ⟳ ${elapsed}  ${theme.fg("toolTitle", agent.name)}${agentTag}  ${progress}`,
+        );
+      }
+
+      const content = new Text([header, ...agentLines].join("\n"), 0, 0);
+      box.addChild(content);
+      return box;
+    },
+    { placement: "belowEditor" },
+  );
+}
+
+function startWidgetRefresh() {
+  if (widgetInterval) return;
+  updateWidget(); // immediate first render
+  widgetInterval = setInterval(() => {
+    updateWidget();
+  }, 1000);
+}
+
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -452,6 +520,11 @@ async function watchSubagent(
             claimedFiles.add(basename(progress.file));
           }
         }
+        // Update entries/bytes for widget display
+        if (progress) {
+          running.entries = progress.entries;
+          running.bytes = progress.bytes;
+        }
         onProgress?.({ elapsed, entries: progress?.entries, bytes: progress?.bytes });
       },
     });
@@ -539,6 +612,23 @@ async function runSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Capture the UI context for widget updates
+  pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
+  });
+
+  // Clean up on session shutdown
+  pi.on("session_shutdown", (_event, _ctx) => {
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    for (const [_id, agent] of runningSubagents) {
+      agent.abortController?.abort();
+    }
+    runningSubagents.clear();
+  });
+
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
   const deniedTools = new Set(
     (process.env.PI_DENY_TOOLS ?? "").split(",").map((s) => s.trim()).filter(Boolean)
@@ -590,8 +680,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const watcherAbort = new AbortController();
       running.abortController = watcherAbort;
 
+      // Start widget refresh when first agent launches
+      startWidgetRefresh();
+
       // Fire-and-forget: start watching in background
       watchSubagent(running, watcherAbort.signal).then((result) => {
+        updateWidget(); // reflect removal from Map immediately
         const sessionRef = result.sessionFile
           ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
           : "";
@@ -613,6 +707,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         }, { triggerTurn: true, deliverAs: "steer" });
       }).catch((err) => {
+        updateWidget();
         pi.sendMessage({
           customType: "subagent_result",
           content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -770,6 +865,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         running.abortController = watcherAbort;
 
         watchSubagent(running, watcherAbort.signal).then((result) => {
+          updateWidget(); // reflect removal from Map immediately
           const sessionRef = result.sessionFile
             ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
             : "";
@@ -791,6 +887,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             },
           }, { triggerTurn: true, deliverAs: "steer" });
         }).catch((err) => {
+          updateWidget();
           pi.sendMessage({
             customType: "subagent_result",
             content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -799,6 +896,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }, { triggerTurn: true, deliverAs: "steer" });
         });
       }
+
+      // Start widget refresh after all agents are launched
+      startWidgetRefresh();
 
       // Return immediately
       return {
