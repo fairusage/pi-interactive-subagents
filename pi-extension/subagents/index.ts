@@ -263,6 +263,37 @@ function formatElapsedMMSS(startTime: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+const ACCENT_COLOR = "\x1b[38;2;77;163;255m";
+const RESET = "\x1b[0m";
+
+/**
+ * Build a bordered widget line: │ content │
+ */
+function borderLine(content: string, innerWidth: number): string {
+  // We need to measure visible width to pad correctly
+  const visible = content.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const pad = Math.max(0, innerWidth - visible);
+  return `${ACCENT_COLOR}│${RESET} ${content}${" ".repeat(pad)} ${ACCENT_COLOR}│${RESET}`;
+}
+
+/**
+ * Build the bordered top line: ╭─ Title ──────── info ─╮
+ */
+function borderTop(title: string, info: string, innerWidth: number): string {
+  const titlePart = ` ${title} `;
+  const infoPart = ` ${info} `;
+  const fillLen = Math.max(0, innerWidth - titlePart.length - infoPart.length);
+  const fill = "─".repeat(fillLen);
+  return `${ACCENT_COLOR}╭─${titlePart}${fill}${infoPart}─╮${RESET}`;
+}
+
+/**
+ * Build the bordered bottom line: ╰──────────────────────╯
+ */
+function borderBottom(innerWidth: number): string {
+  return `${ACCENT_COLOR}╰─${"─".repeat(innerWidth)}─╯${RESET}`;
+}
+
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
 
@@ -277,32 +308,35 @@ function updateWidget() {
 
   latestCtx.ui.setWidget(
     "subagent-status",
-    (_tui: any, theme: any) => {
-      const box = new Box(1, 0, (text: string) => theme.bg("toolPendingBg", text));
+    (_tui: any, _theme: any) => {
+      return {
+        invalidate() {},
+        render(width: number) {
+          const innerWidth = Math.max(10, width - 4);
+          const count = runningSubagents.size;
+          const title = "Subagents";
+          const info = `${count} running`;
 
-      const count = runningSubagents.size;
-      const label = count === 1 ? "1 subagent" : `${count} subagents`;
-      const header =
-        theme.fg("accent", "⟳ ") +
-        theme.bold(label) +
-        theme.fg("dim", " running");
+          const lines: string[] = [borderTop(title, info, innerWidth)];
 
-      const agentLines: string[] = [];
-      for (const [_id, agent] of runningSubagents) {
-        const elapsed = theme.fg("accent", formatElapsedMMSS(agent.startTime));
-        const name = theme.bold(agent.name);
-        const agentTag = agent.agent ? theme.fg("dim", ` (${agent.agent})`) : "";
-        const progress =
-          agent.entries != null && agent.bytes != null
-            ? theme.fg("dim", ` · ${agent.entries} msgs (${formatBytes(agent.bytes)})`)
-            : theme.fg("dim", " · starting…");
+          for (const [_id, agent] of runningSubagents) {
+            const elapsed = formatElapsedMMSS(agent.startTime);
+            const agentTag = agent.agent ? ` (${agent.agent})` : "";
+            const progress =
+              agent.entries != null && agent.bytes != null
+                ? `${agent.entries} msgs (${formatBytes(agent.bytes)})`
+                : "starting…";
 
-        agentLines.push(`  ${elapsed}  ${name}${agentTag}${progress}`);
-      }
+            lines.push(borderLine(
+              `${ACCENT_COLOR}⟳${RESET} ${elapsed}  ${agent.name}${agentTag}  ${progress}`,
+              innerWidth,
+            ));
+          }
 
-      const content = new Text([header, ...agentLines].join("\n"), 0, 0);
-      box.addChild(content);
-      return box;
+          lines.push(borderBottom(innerWidth));
+          return lines;
+        },
+      };
     },
     { placement: "aboveEditor" },
   );
@@ -1066,7 +1100,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // ── subagent_result message renderer ──
-  pi.registerMessageRenderer("subagent_result", (message, _options, theme) => {
+  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
 
@@ -1093,15 +1127,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build content for the box
         const contentLines = [header];
-        if (summary) {
-          const previewLines = summary.split("\n").slice(0, 5);
-          for (const line of previewLines) {
-            contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+
+        if (options.expanded) {
+          // Full view: complete summary + session info
+          if (summary) {
+            for (const line of summary.split("\n")) {
+              contentLines.push(line.slice(0, width - 6));
+            }
           }
-          const totalLines = summary.split("\n").length;
-          if (totalLines > 5) {
-            contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
+          if (details.sessionFile) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
+            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
           }
+        } else {
+          // Collapsed: preview + expand hint
+          if (summary) {
+            const previewLines = summary.split("\n").slice(0, 5);
+            for (const line of previewLines) {
+              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+            }
+            const totalLines = summary.split("\n").length;
+            if (totalLines > 5) {
+              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
+            }
+          }
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }
 
         // Render via Box for background + padding
