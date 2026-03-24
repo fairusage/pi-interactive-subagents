@@ -321,8 +321,7 @@ function startWidgetRefresh() {
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
- * For blocking execution, call watchSubagent() on the returned object.
- * runSubagent() is a convenience wrapper that does both.
+ * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
@@ -596,20 +595,6 @@ async function watchSubagent(
   }
 }
 
-/**
- * Convenience wrapper: launch a subagent and wait for it to complete.
- * Existing tools call this and continue to behave exactly as before.
- */
-async function runSubagent(
-  params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
-  signal: AbortSignal,
-  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
-  options?: { surface?: string; claimedFiles?: Set<string> },
-): Promise<SubagentResult> {
-  const running = await launchSubagent(params, ctx, options);
-  return watchSubagent(running, signal, onProgress);
-}
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
@@ -641,13 +626,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     name: "subagent",
     label: "Subagent",
     description:
-      "Spawn a sub-agent in a dedicated terminal multiplexer pane with shared session context. " +
-      "The sub-agent branches from the current session, works independently, " +
-      "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
+      "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+      "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "Supports cmux, tmux, and zellij.",
     promptSnippet:
-      "Spawn a sub-agent in a dedicated terminal multiplexer pane with shared session context. " +
-      "The sub-agent branches from the current session, works independently, " +
-      "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
+      "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+      "Returns immediately — the agent runs in the background and steers results back when done. " +
+      "Supports cmux, tmux, and zellij.",
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -793,12 +778,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     name: "parallel_subagents",
     label: "Parallel Subagents",
     description:
-      "Run multiple autonomous sub-agents concurrently. Each agent spawns in its own multiplexer pane " +
-      "and runs independently. Results stream in as each agent completes so you do not have to wait for all of them. " +
+      "Run multiple sub-agents concurrently. Each agent spawns in its own multiplexer pane and returns immediately. " +
+      "Results steer back as each agent completes — no waiting for all to finish. " +
       "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
     promptSnippet:
-      "Run multiple autonomous sub-agents concurrently. Each agent spawns in its own multiplexer pane " +
-      "and runs independently. Results stream in as each agent completes so you do not have to wait for all of them. " +
+      "Run multiple sub-agents concurrently. Each agent spawns in its own multiplexer pane and returns immediately. " +
+      "Results steer back as each agent completes — no waiting for all to finish. " +
       "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
     parameters: Type.Object({
       agents: Type.Array(ParallelSubagentEntry, {
@@ -1072,11 +1057,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     label: "Resume Subagent",
     description:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Opens an interactive session from the given session file path. " +
+      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     promptSnippet:
       "Resume a previous sub-agent session in a new multiplexer pane. " +
-      "Opens an interactive session from the given session file path. " +
+      "Returns immediately — the resumed session runs in the background and steers results back when done. " +
       "Use when a sub-agent was cancelled or needs follow-up work.",
     parameters: Type.Object({
       sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
@@ -1093,53 +1078,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, _opts, theme) {
       const details = result.details as any;
       const name = details?.name ?? "Resume";
 
-      if (isPartial) {
-        const text =
-          theme.fg("accent", `Switch to the "${name}" terminal. `) +
-          theme.fg("dim", "Exit (Ctrl+D) to return.");
-        return new Text(text, 0, 0);
-      }
-
-      const exitCode = details?.exitCode ?? 0;
-      const elapsed = details?.elapsed != null ? formatElapsed(details.elapsed) : "?";
-      const summaryText =
-        typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-
-      if (exitCode !== 0) {
-        const text =
-          theme.fg("error", "✗") +
-          " " +
+      if (details?.status === "started") {
+        return new Text(
+          theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — failed (exit code ${exitCode})`);
-        return new Text(text, 0, 0);
+          theme.fg("dim", " — resumed"),
+          0, 0
+        );
       }
 
-      const cleanSummary = summaryText.replace(/\n\nSession: .+\nResume: .+$/, "").replace(/\n\nSession: .+$/, "");
-      const preview =
-        expanded || cleanSummary.length <= 120
-          ? cleanSummary
-          : cleanSummary.slice(0, 120) + "…";
-
-      const sessionLine = details?.sessionPath
-        ? "\n" + theme.fg("dim", `Session: ${details.sessionPath}`)
-        : "";
-
-      const text =
-        theme.fg("success", "✓") +
-        " " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", ` — completed (${elapsed})`) +
-        (preview ? "\n" + theme.fg("text", preview) : "") +
-        sessionLine;
-
-      return new Text(text, 0, 0);
+      // Fallback
+      const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
     },
 
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId, params, _signal, _onUpdate) {
       const name = params.name ?? "Resume";
       const startTime = Date.now();
 
@@ -1157,105 +1114,100 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       // Record entry count before resuming so we can extract new messages
       const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-      let surface: string | null = null;
+      const surface = createSurface(name);
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
 
-      try {
-        surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+      // Build pi resume command
+      const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+      // Load subagent-done extension so the agent can self-terminate if needed
+      const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+      parts.push("-e", shellEscape(subagentDonePath));
 
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+      let cleanupMsgFile: string | undefined;
+      if (params.message) {
+        const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
+        writeFileSync(msgFile, params.message, "utf8");
+        cleanupMsgFile = msgFile;
+        parts.push(`@${msgFile}`);
+      }
 
-        if (params.message) {
-          // Write follow-up message to a temp file and pass via @file
-          const msgFile = join(tmpdir(), `subagent-resume-${Date.now()}.md`);
-          writeFileSync(msgFile, params.message, "utf8");
-          parts.push(`@${msgFile}`);
-          const command = `${parts.join(" ")}; rm -f ${shellEscape(msgFile)}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-          sendCommand(surface, command);
-        } else {
-          const command = `${parts.join(" ")}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-          sendCommand(surface, command);
-        }
+      const command = `${parts.join(" ")}${cleanupMsgFile ? `; rm -f ${shellEscape(cleanupMsgFile)}` : ""}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+      sendCommand(surface, command);
 
-        const exitCode = await pollForExit(surface, signal ?? new AbortController().signal, {
-          interval: 3000,
-          onTick() {
-            const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
-            let sessionEntries: number | undefined;
-            let sessionBytes: number | undefined;
-            try {
-              const stat = statSync(params.sessionPath);
-              const raw = readFileSync(params.sessionPath, "utf8");
-              sessionEntries = raw.split("\n").filter((l) => l.trim()).length;
-              sessionBytes = stat.size;
-            } catch {}
-            onUpdate?.({
-              content: [{ type: "text", text: `${elapsed} elapsed` }],
-              details: {
-                name,
-                sessionPath: params.sessionPath,
-                startTime,
-                phase: "running",
-                sessionEntries,
-                sessionBytes,
-              },
-            });
-          },
-        });
+      // Register as a running subagent for widget tracking
+      const id = Math.random().toString(16).slice(2, 10);
+      const sessionDir = dirname(params.sessionPath);
+      const existingSessionFiles = new Set(
+        readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
+      );
+      const running: RunningSubagent = {
+        id,
+        name,
+        task: params.message ?? "resumed session",
+        surface,
+        startTime,
+        sessionDir,
+        existingSessionFiles,
+        trackedSessionFile: params.sessionPath,
+      };
+      runningSubagents.set(id, running);
+      startWidgetRefresh();
 
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      // Fire-and-forget watcher
+      const watcherAbort = new AbortController();
+      running.abortController = watcherAbort;
 
-        // Extract summary from new entries
+      watchSubagent(running, watcherAbort.signal, ({ entries, bytes }) => {
+        running.entries = entries;
+        running.bytes = bytes;
+      }).then((result) => {
+        updateWidget();
         const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
         const summary =
           findLastAssistantMessage(allEntries) ??
-          (exitCode !== 0
-            ? `Resumed session exited with code ${exitCode}`
+          (result.exitCode !== 0
+            ? `Resumed session exited with code ${result.exitCode}`
             : "Resumed session exited without new output");
-
-        closeSurface(surface);
-        surface = null;
-
         const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
 
-        return {
-          content: [{ type: "text", text: `${summary}${sessionRef}` }],
-          details: { name, sessionPath: params.sessionPath, exitCode, elapsed },
-        };
-      } catch (err: any) {
-        if (surface) {
-          try { closeSurface(surface); } catch {}
-          surface = null;
-        }
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `${summary}${sessionRef}`,
+          display: true,
+          details: {
+            name,
+            task: params.message ?? "resumed session",
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: params.sessionPath,
+          },
+        }, { triggerTurn: true, deliverAs: "steer" });
+      }).catch((err) => {
+        updateWidget();
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `Resume error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name, error: err?.message },
+        }, { triggerTurn: true, deliverAs: "steer" });
+      });
 
-        if (signal?.aborted) {
-          return {
-            content: [{ type: "text", text: "Resume cancelled." }],
-            details: { error: "cancelled" },
-          };
-        }
-
-        return {
-          content: [{ type: "text", text: `Resume error: ${err?.message ?? String(err)}` }],
-          details: { error: err?.message },
-        };
-      }
+      return {
+        content: [{ type: "text", text: `Session "${name}" resumed.` }],
+        details: { id, name, sessionPath: params.sessionPath, status: "started" },
+      };
     },
   });
 
-  // /iterate command — fork the session into an interactive subagent
+  // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {
-    description: "Fork session into an interactive subagent for focused work (bugfixes, iteration)",
-    handler: async (args, ctx) => {
+    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
+    handler: async (args, _ctx) => {
       const task = args?.trim() || "";
       const toolCall = task
-        ? `Use subagent to start an iterate session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to start an iterate session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
@@ -1281,7 +1233,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${agentName[0].toUpperCase() + agentName.slice(1)}", task: ${JSON.stringify(taskText)}`;
+      const displayName = agentName[0].toUpperCase() + agentName.slice(1);
+      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });
