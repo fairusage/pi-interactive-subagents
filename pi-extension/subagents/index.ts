@@ -17,6 +17,7 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
+  createSurfaceSplit,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -226,6 +227,14 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/**
+ * Track the first subagent surface so subsequent agents split down from it
+ * instead of splitting right (which creates ever-narrower columns).
+ * Set synchronously before any await so concurrent launches see it immediately.
+ * Reset to null when all subagents finish.
+ */
+let subagentColumnSurface: string | null = null;
+
 // ── Widget management ──
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
@@ -374,9 +383,24 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  // Layout strategy: first subagent splits right from main (50/50).
+  // Subsequent subagents split down from the first subagent's pane,
+  // stacking vertically in the right column. This avoids the "all
+  // right-splits" problem where each pane gets narrower until pi's
+  // TUI crashes from insufficient width.
+  //
+  // Uses subagentColumnSurface (set synchronously, before any await)
+  // so concurrent launches all see it on the same event loop tick.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  let surface: string;
+  if (options?.surface) {
+    surface = options.surface;
+  } else if (subagentColumnSurface) {
+    surface = createSurfaceSplit(params.name, "down", subagentColumnSurface);
+  } else {
+    surface = createSurface(params.name);
+    subagentColumnSurface = surface;
+  }
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, 500));
   }
@@ -577,6 +601,11 @@ async function watchSubagent(
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
+    // Reset column tracker when all subagents are done
+    if (runningSubagents.size === 0) {
+      subagentColumnSurface = null;
+    }
+
     // Clean up temp fork file
     if (forkCleanupFile) {
       try {
@@ -595,6 +624,11 @@ async function watchSubagent(
       closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
+
+    // Reset column tracker when all subagents are done
+    if (runningSubagents.size === 0) {
+      subagentColumnSurface = null;
+    }
 
     if (signal.aborted) {
       return {
