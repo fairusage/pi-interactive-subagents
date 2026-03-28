@@ -937,11 +937,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Validate prerequisites
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult('subagents')
-        }
-
         if (!ctx.sessionManager.getSessionFile()) {
           return {
             content: [
@@ -954,58 +949,77 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx)
+        // Resolve mode: tool param > agent frontmatter > interactive (default)
+        const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null
+        const isBackground = params.background ?? (agentDefs?.mode === 'background' ? true : false)
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController()
-        running.abortController = watcherAbort
+        // Helper: wire up the steer-back message after a subagent completes
+        const wireSteerBack = (running: RunningSubagent, watchPromise: Promise<SubagentResult>) => {
+          watchPromise
+            .then((result) => {
+              updateWidget()
+              const sessionRef = result.sessionFile
+                ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+                : ''
+              const content =
+                result.exitCode !== 0
+                  ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+                  : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`
 
-        // Start widget refresh when first agent launches
-        startWidgetRefresh()
-
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget() // reflect removal from Map immediately
-            const sessionRef = result.sessionFile
-              ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-              : ''
-            const content =
-              result.exitCode !== 0
-                ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-                : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`
-
-            pi.sendMessage(
-              {
-                customType: 'subagent_result',
-                content,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
+              pi.sendMessage(
+                {
+                  customType: 'subagent_result',
+                  content,
+                  display: true,
+                  details: {
+                    name: running.name,
+                    task: running.task,
+                    agent: running.agent,
+                    exitCode: result.exitCode,
+                    elapsed: result.elapsed,
+                    sessionFile: result.sessionFile,
+                  },
                 },
-              },
-              { triggerTurn: true, deliverAs: 'steer' },
-            )
-          })
-          .catch((err) => {
-            updateWidget()
-            pi.sendMessage(
-              {
-                customType: 'subagent_result',
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: 'steer' },
-            )
-          })
+                { triggerTurn: true, deliverAs: 'steer' },
+              )
+            })
+            .catch((err) => {
+              updateWidget()
+              pi.sendMessage(
+                {
+                  customType: 'subagent_result',
+                  content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                  display: true,
+                  details: { name: running.name, task: running.task, error: err?.message },
+                },
+                { triggerTurn: true, deliverAs: 'steer' },
+              )
+            })
+        }
+
+        let running: RunningSubagent
+
+        if (isBackground) {
+          // Background mode — no mux required, headless child process
+          running = await launchBackgroundSubagent(params, ctx)
+          const watcherAbort = new AbortController()
+          running.abortController = watcherAbort
+          startWidgetRefresh()
+          wireSteerBack(
+            running,
+            watchBackgroundSubagent(running, watcherAbort.signal, agentDefs?.timeout),
+          )
+        } else {
+          // Interactive mode — requires a terminal multiplexer
+          if (!isMuxAvailable()) {
+            return muxUnavailableResult('subagents')
+          }
+          running = await launchSubagent(params, ctx)
+          const watcherAbort = new AbortController()
+          running.abortController = watcherAbort
+          startWidgetRefresh()
+          wireSteerBack(running, watchSubagent(running, watcherAbort.signal))
+        }
 
         // Return immediately
         return {
@@ -1026,6 +1040,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             status: 'started',
+            mode: isBackground ? 'background' : 'interactive',
           },
         }
       },
