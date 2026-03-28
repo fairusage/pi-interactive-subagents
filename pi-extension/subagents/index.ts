@@ -334,7 +334,8 @@ function updateWidget() {
           for (const [_id, agent] of runningSubagents) {
             const elapsed = formatElapsedMMSS(agent.startTime)
             const agentTag = agent.agent ? ` (${agent.agent})` : ''
-            const left = ` ${elapsed}  ${agent.name}${agentTag} `
+            const modeIcon = agent.mode === 'background' ? '⚙' : '▸'
+            const left = ` ${elapsed}  ${modeIcon} ${agent.name}${agentTag} `
             const right =
               agent.entries != null && agent.bytes != null
                 ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
@@ -888,6 +889,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       widgetInterval = null
     }
     for (const [_id, agent] of runningSubagents) {
+      // Kill background process groups before aborting
+      if (agent.childProcess?.pid) {
+        try {
+          process.kill(-agent.childProcess.pid, 'SIGTERM')
+        } catch {
+          agent.childProcess.kill('SIGTERM')
+        }
+      }
       agent.abortController?.abort()
     }
     runningSubagents.clear()
@@ -915,7 +924,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         'Do NOT fabricate, assume, or summarize results after calling this tool. ' +
         'Either wait for the steer message or move on to other work.',
       promptSnippet:
-        'Spawn a sub-agent in a dedicated terminal multiplexer pane. ' +
+        'Spawn a sub-agent. Runs in a terminal pane by default (interactive). ' +
+        "Set background: true for autonomous tasks that don't need user interaction " +
+        '(scouting, reviewing, implementing). Background agents run headlessly — ' +
+        'no terminal pane, no mux required, unlimited parallelism. ' +
         'IMPORTANT: This tool returns IMMEDIATELY — the sub-agent runs asynchronously in the background. ' +
         'You will NOT have results when this tool returns. Results are delivered later via a steer message. ' +
         'Do NOT fabricate, assume, or summarize results after calling this tool. ' +
@@ -1110,7 +1122,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       async execute() {
         const agents = new Map<
           string,
-          { name: string; description?: string; model?: string; source: string }
+          { name: string; description?: string; model?: string; mode?: string; source: string }
         >()
 
         const dirs = [
@@ -1134,10 +1146,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return m ? m[1].trim() : undefined
             }
             const name = get('name') ?? file.replace(/\.md$/, '')
+            const modeVal = get('mode')
             agents.set(name, {
               name,
               description: get('description'),
               model: get('model'),
+              mode: modeVal === 'background' || modeVal === 'interactive' ? modeVal : undefined,
               source,
             })
           }
@@ -1153,9 +1167,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const list = [...agents.values()]
         const lines = list.map((a) => {
           const badge = a.source === 'project' ? ' (project)' : ''
+          const modeTag = a.mode ? ` (${a.mode})` : ''
           const desc = a.description ? ` — ${a.description}` : ''
           const model = a.model ? ` [${a.model}]` : ''
-          return `• ${a.name}${badge}${model}${desc}`
+          return `• ${a.name}${modeTag}${badge}${model}${desc}`
         })
 
         return {
@@ -1172,9 +1187,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const lines = agents.map((a: any) => {
           const badge = a.source === 'project' ? theme.fg('accent', ' (project)') : ''
+          const modeTag = a.mode ? theme.fg('dim', ` (${a.mode})`) : ''
           const desc = a.description ? theme.fg('dim', ` — ${a.description}`) : ''
           const model = a.model ? theme.fg('dim', ` [${a.model}]`) : ''
-          return `  ${theme.fg('toolTitle', theme.bold(a.name))}${badge}${model}${desc}`
+          return `  ${theme.fg('toolTitle', theme.bold(a.name))}${modeTag}${badge}${model}${desc}`
         })
         return new Text(lines.join('\n'), 0, 0)
       },
