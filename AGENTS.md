@@ -1,5 +1,31 @@
 # Agent Instructions
 
+## Git & Release Workflow
+
+This is a **fork** of `HazAT/pi-interactive-subagents` with custom changes (background subagents).
+
+- **origin** → `HazAT/pi-interactive-subagents` (upstream, read-only)
+- **fork** → `fairusage/pi-interactive-subagents` (our copy, push here)
+- **Settings pin:** `git:github.com/fairusage/pi-interactive-subagents@<tag>` in `~/.pi/agent/settings.json`
+
+**Before starting work**, check for upstream changes:
+
+```bash
+git fetch origin && git log main..origin/main --oneline
+```
+
+**After making changes**, always push to `fork` (not `origin`):
+
+```bash
+git push fork main --tags
+```
+
+**To release**: bump `version` in package.json, commit, tag `v1.X.0`, push to fork, update the `@tag` in settings.json. See `SYNC.md` for full steps.
+
+**Never run `pi update` without checking** — it resets git packages to origin/HEAD. The `@tag` pin in settings prevents this, but verify after any pi update.
+
+---
+
 This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get started.
 
 ## Quick Reference
@@ -13,6 +39,7 @@ bd sync               # Sync with git
 ```
 
 <!-- BEGIN BEADS INTEGRATION -->
+
 ## Issue Tracking with bd (beads)
 
 **IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
@@ -120,6 +147,7 @@ For more details, see README.md and docs/QUICKSTART.md.
 7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
+
 - Work is NOT complete until `git push` succeeds
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
