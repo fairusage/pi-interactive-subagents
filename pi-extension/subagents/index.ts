@@ -569,7 +569,155 @@ function buildSubagentCommand(
   }
 }
 
-// ── Interactive launch ──
+// ── Background launch & watch ──
+
+/**
+ * Launch a background subagent as a headless child process. No terminal pane
+ * or mux required. Uses `spawn()` with `detached: true` for clean process
+ * group management.
+ */
+async function launchBackgroundSubagent(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
+): Promise<RunningSubagent> {
+  const startTime = Date.now()
+  const id = Math.random().toString(16).slice(2, 10)
+  const cmd = buildSubagentCommand(params, ctx, { background: true })
+
+  const invocation = getPiInvocation(cmd.args)
+
+  const child = spawn(invocation.command, invocation.args, {
+    cwd: cmd.effectiveCwd ?? process.cwd(),
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...cmd.envVars },
+  })
+
+  // Unref so the child doesn't prevent the parent from exiting naturally
+  child.unref()
+
+  const running: RunningSubagent = {
+    id,
+    name: params.name,
+    task: params.task,
+    agent: params.agent,
+    mode: 'background',
+    childProcess: child,
+    startTime,
+    sessionFile: cmd.sessionFile,
+    forkCleanupFile: cmd.forkCleanupFile,
+  }
+
+  runningSubagents.set(id, running)
+  return running
+}
+
+/**
+ * Watch a background subagent until it exits. Listens for the child process
+ * exit event, polls the session file for widget updates, and handles
+ * timeout and abort.
+ */
+async function watchBackgroundSubagent(
+  running: RunningSubagent,
+  signal: AbortSignal,
+  timeout?: number,
+): Promise<SubagentResult> {
+  const child = running.childProcess!
+
+  return new Promise((resolve) => {
+    // Timeout: kill process group after N seconds
+    let timer: ReturnType<typeof setTimeout> | undefined
+    if (timeout && timeout > 0) {
+      timer = setTimeout(() => {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, 'SIGTERM')
+          } catch {
+            child.kill('SIGTERM')
+          }
+        }
+      }, timeout * 1000)
+    }
+
+    // Session file polling for widget updates
+    const pollInterval = setInterval(() => {
+      try {
+        if (existsSync(running.sessionFile)) {
+          const stat = statSync(running.sessionFile)
+          const raw = readFileSync(running.sessionFile, 'utf8')
+          running.entries = raw.split('\n').filter((l) => l.trim()).length
+          running.bytes = stat.size
+        }
+      } catch {}
+    }, 1000)
+
+    // Abort handler: kill process group
+    const onAbort = () => {
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGTERM')
+        } catch {
+          child.kill('SIGTERM')
+        }
+        // Force kill after 5s if still alive
+        setTimeout(() => {
+          if (!child.killed && child.pid) {
+            try {
+              process.kill(-child.pid, 'SIGKILL')
+            } catch {
+              child.kill('SIGKILL')
+            }
+          }
+        }, 5000)
+      }
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    // Exit handler
+    child.on('exit', (code) => {
+      if (timer) clearTimeout(timer)
+      clearInterval(pollInterval)
+      signal.removeEventListener('abort', onAbort)
+
+      const elapsed = Math.floor((Date.now() - running.startTime) / 1000)
+      const exitCode = code ?? 1
+
+      let summary: string
+      if (existsSync(running.sessionFile)) {
+        const allEntries = getNewEntries(running.sessionFile, 0)
+        summary =
+          findLastAssistantMessage(allEntries) ??
+          (exitCode !== 0
+            ? `Background agent exited with code ${exitCode}`
+            : 'Background agent exited without output')
+      } else {
+        summary = `Background agent exited with code ${exitCode}`
+      }
+
+      runningSubagents.delete(running.id)
+      if (runningSubagents.size === 0) {
+        subagentColumnSurface = null
+      }
+
+      if (running.forkCleanupFile) {
+        try {
+          unlinkSync(running.forkCleanupFile)
+        } catch {}
+      }
+
+      resolve({
+        name: running.name,
+        task: running.task,
+        summary,
+        sessionFile: running.sessionFile,
+        exitCode,
+        elapsed,
+      })
+    })
+  })
+}
+
+// ── Interactive launch & watch ──
 
 /**
  * Launch an interactive subagent: creates the multiplexer pane, builds the
