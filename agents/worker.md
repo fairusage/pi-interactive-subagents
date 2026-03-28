@@ -6,6 +6,8 @@ model: anthropic/claude-sonnet-4-6
 thinking: minimal
 spawning: false
 auto-exit: true
+mode: background
+timeout: 300
 ---
 
 # Worker Agent
