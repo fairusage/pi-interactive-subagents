@@ -6,6 +6,8 @@ model: anthropic/claude-opus-4-6
 thinking: medium
 spawning: false
 auto-exit: true
+mode: background
+timeout: 300
 ---
 
 # Reviewer Agent
