@@ -361,11 +361,9 @@ function startWidgetRefresh() {
   }, 1000)
 }
 
-// ── Shared command building ──
-
 /**
- * Resolve the correct pi binary path. Handles node, bun, and bundled
- * executables. Adopted from pi's official subagent example.
+ * Resolve the correct pi binary path for spawn(). Handles node, bun,
+ * and bundled executables.
  */
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1]
@@ -381,30 +379,78 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 }
 
 /**
- * Output from buildSubagentCommand(). Contains everything needed to launch
- * a subagent in either interactive or background mode.
- * Args are NOT shell-escaped — callers handle escaping as needed.
+ * Generate a unique session file path for a subagent.
  */
-interface SubagentCommandInfo {
-  args: string[]
-  envVars: Record<string, string>
-  sessionFile: string
-  forkCleanupFile?: string
-  effectiveCwd: string | null
-  agentDefs: AgentDefaults | null
-  fullTask: string
+function generateSubagentSessionFile(sessionDir: string): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23) + 'Z'
+  const uuid = [
+    Math.random().toString(16).slice(2, 10),
+    Math.random().toString(16).slice(2, 10),
+    Math.random().toString(16).slice(2, 10),
+    Math.random().toString(16).slice(2, 6),
+  ].join('-')
+  return join(sessionDir, `${ts}_${uuid}.jsonl`)
 }
 
 /**
- * Build the pi CLI arguments and env vars shared by interactive and background
- * launch paths. Returns raw (unescaped) values — the caller shell-escapes for
- * interactive mode or passes directly to spawn() for background mode.
+ * Create a fork file from the current session, stripping the trailing
+ * meta-message that triggered this subagent call.
  */
-function buildSubagentCommand(
+function createForkFile(sessionFile: string): string {
+  const raw = readFileSync(sessionFile, 'utf8')
+  const lines = raw.split('\n').filter((l) => l.trim())
+  let truncateAt = lines.length
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i])
+      if (entry.type === 'message' && entry.message?.role === 'user') {
+        truncateAt = i
+        break
+      }
+    } catch {}
+  }
+  const cleanLines = lines.slice(0, truncateAt)
+  const forkFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`)
+  writeFileSync(forkFile, cleanLines.join('\n') + '\n', 'utf8')
+  return forkFile
+}
+
+/**
+ * Write the task to an artifact file and return the @path reference.
+ */
+function writeTaskArtifact(
+  name: string,
+  task: string,
+  ctx: { sessionManager: { getSessionId(): string }; cwd: string },
+): string {
+  const sessionId = ctx.sessionManager.getSessionId()
+  const artifactDir = getArtifactDir(ctx.cwd, sessionId)
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const safeName = name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+  const artifactPath = join(artifactDir, `context/${safeName || 'subagent'}-${ts}.md`)
+  mkdirSync(dirname(artifactPath), { recursive: true })
+  writeFileSync(artifactPath, task, 'utf8')
+  return artifactPath
+}
+
+// ── Background launch & watch ──
+
+/**
+ * Launch a background subagent as a headless `pi -p` child process.
+ * No terminal pane or mux required.
+ */
+async function launchBackgroundSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
-  options?: { background?: boolean },
-): SubagentCommandInfo {
+): Promise<RunningSubagent> {
+  const startTime = Date.now()
+  const id = Math.random().toString(16).slice(2, 10)
+
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null
   const effectiveModel = params.model ?? agentDefs?.model
   const effectiveTools = params.tools ?? agentDefs?.tools
@@ -414,83 +460,29 @@ function buildSubagentCommand(
   const sessionFile = ctx.sessionManager.getSessionFile()
   if (!sessionFile) throw new Error('No session file')
 
-  const sessionDir = dirname(sessionFile)
+  const subagentSessionFile = generateSubagentSessionFile(dirname(sessionFile))
 
-  // Generate a deterministic session file path for this subagent.
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 23) + 'Z'
-  const id = Math.random().toString(16).slice(2, 10)
-  const uuid = [
-    id,
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 6),
-  ].join('-')
-  const subagentSessionFile = join(sessionDir, `${ts}_${uuid}.jsonl`)
-
-  // Build the task message
-  const isBackground = !!options?.background
+  // Build task message — background agents are always autonomous
   const denySet = resolveDenyTools(agentDefs)
-  const agentType = params.agent ?? params.name
-
   let fullTask: string
   if (params.fork) {
     fullTask = params.task
   } else {
-    const modeHint =
-      isBackground || agentDefs?.autoExit
-        ? 'Complete your task autonomously.'
-        : 'Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.'
-    const summaryInstruction =
-      isBackground || agentDefs?.autoExit
-        ? 'Your FINAL assistant message should summarize what you accomplished.'
-        : 'Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.'
-    // Background agents have no pane to rename
-    const tabTitleInstruction =
-      isBackground || denySet.has('set_tab_title')
-        ? ''
-        : `As your FIRST action, set the tab title using set_tab_title. ` +
-          `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
-          `Example: "[${agentType}] Analyzing auth module". Keep it concise.`
     const identity = agentDefs?.body ?? params.systemPrompt ?? null
     const roleBlock = identity ? `\n\n${identity}` : ''
-    fullTask = `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`
+    fullTask =
+      `${roleBlock}\n\nComplete your task autonomously.` +
+      `\n\n${params.task}` +
+      `\n\nYour FINAL assistant message should summarize what you accomplished.`
   }
 
-  // Build pi CLI args (raw, not shell-escaped)
-  const args: string[] = []
+  // Build pi CLI args
+  const args: string[] = ['-p', '--session', subagentSessionFile]
 
-  if (isBackground) {
-    args.push('-p')
-  }
-
-  args.push('--session', subagentSessionFile)
-
-  // Fork: create a clean copy of the parent session
   let forkCleanupFile: string | undefined
   if (params.fork) {
-    const raw = readFileSync(sessionFile, 'utf8')
-    const lines = raw.split('\n').filter((l) => l.trim())
-    let truncateAt = lines.length
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(lines[i])
-        if (entry.type === 'message' && entry.message?.role === 'user') {
-          truncateAt = i
-          break
-        }
-      } catch {}
-    }
-    const cleanLines = lines.slice(0, truncateAt)
-    forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`)
-    writeFileSync(forkCleanupFile, cleanLines.join('\n') + '\n', 'utf8')
+    forkCleanupFile = createForkFile(sessionFile)
     args.push('--fork', forkCleanupFile)
-  }
-
-  // Interactive agents get the subagent-done extension; background agents
-  // run with -p and exit naturally when the agent loop completes.
-  if (!isBackground) {
-    const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), 'subagent-done.ts')
-    args.push('-e', subagentDonePath)
   }
 
   if (effectiveModel) {
@@ -504,9 +496,7 @@ function buildSubagentCommand(
       .split(',')
       .map((t) => t.trim())
       .filter((t) => BUILTIN_TOOLS.has(t))
-    if (builtins.length > 0) {
-      args.push('--tools', builtins.join(','))
-    }
+    if (builtins.length > 0) args.push('--tools', builtins.join(','))
   }
 
   if (effectiveSkills) {
@@ -518,38 +508,20 @@ function buildSubagentCommand(
     }
   }
 
-  // Pass task: fork mode passes it directly, non-fork writes to an artifact file
+  // Pass task
   if (params.fork) {
     args.push(fullTask)
   } else {
-    const sessionId = ctx.sessionManager.getSessionId()
-    const artifactDir = getArtifactDir(ctx.cwd, sessionId)
-    const artifactTs = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '')
-    const artifactName = `context/${safeName || 'subagent'}-${artifactTs}.md`
-    const artifactPath = join(artifactDir, artifactName)
-    mkdirSync(dirname(artifactPath), { recursive: true })
-    writeFileSync(artifactPath, fullTask, 'utf8')
+    const artifactPath = writeTaskArtifact(params.name, fullTask, ctx)
     args.push(`@${artifactPath}`)
   }
 
   // Build env vars
   const envVars: Record<string, string> = {}
-  if (denySet.size > 0) {
-    envVars.PI_DENY_TOOLS = [...denySet].join(',')
-  }
+  if (denySet.size > 0) envVars.PI_DENY_TOOLS = [...denySet].join(',')
   envVars.PI_SUBAGENT_NAME = params.name
-  if (params.agent) {
-    envVars.PI_SUBAGENT_AGENT = params.agent
-  }
-  if (agentDefs?.autoExit || isBackground) {
-    envVars.PI_SUBAGENT_AUTO_EXIT = '1'
-  }
+  if (params.agent) envVars.PI_SUBAGENT_AGENT = params.agent
+  envVars.PI_SUBAGENT_AUTO_EXIT = '1'
 
   // Resolve cwd
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null
@@ -557,44 +529,15 @@ function buildSubagentCommand(
     ? rawCwd.startsWith('/')
       ? rawCwd
       : join(process.cwd(), rawCwd)
-    : null
+    : process.cwd()
 
-  return {
-    args,
-    envVars,
-    sessionFile: subagentSessionFile,
-    forkCleanupFile,
-    effectiveCwd,
-    agentDefs,
-    fullTask,
-  }
-}
-
-// ── Background launch & watch ──
-
-/**
- * Launch a background subagent as a headless child process. No terminal pane
- * or mux required. Uses `spawn()` with `detached: true` for clean process
- * group management.
- */
-async function launchBackgroundSubagent(
-  params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
-): Promise<RunningSubagent> {
-  const startTime = Date.now()
-  const id = Math.random().toString(16).slice(2, 10)
-  const cmd = buildSubagentCommand(params, ctx, { background: true })
-
-  const invocation = getPiInvocation(cmd.args)
-
+  const invocation = getPiInvocation(args)
   const child = spawn(invocation.command, invocation.args, {
-    cwd: cmd.effectiveCwd ?? process.cwd(),
+    cwd: effectiveCwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ...cmd.envVars },
+    env: { ...process.env, ...envVars },
   })
-
-  // Unref so the child doesn't prevent the parent from exiting naturally
   child.unref()
 
   const running: RunningSubagent = {
@@ -605,8 +548,8 @@ async function launchBackgroundSubagent(
     mode: 'background',
     childProcess: child,
     startTime,
-    sessionFile: cmd.sessionFile,
-    forkCleanupFile: cmd.forkCleanupFile,
+    sessionFile: subagentSessionFile,
+    forkCleanupFile,
   }
 
   runningSubagents.set(id, running)
@@ -626,7 +569,6 @@ async function watchBackgroundSubagent(
   const child = running.childProcess!
 
   return new Promise((resolve) => {
-    // Timeout: kill process group after N seconds
     let timer: ReturnType<typeof setTimeout> | undefined
     if (timeout && timeout > 0) {
       timer = setTimeout(() => {
@@ -640,7 +582,6 @@ async function watchBackgroundSubagent(
       }, timeout * 1000)
     }
 
-    // Session file polling for widget updates
     const pollInterval = setInterval(() => {
       try {
         if (existsSync(running.sessionFile)) {
@@ -652,7 +593,6 @@ async function watchBackgroundSubagent(
       } catch {}
     }, 1000)
 
-    // Abort handler: kill process group
     const onAbort = () => {
       if (child.pid) {
         try {
@@ -660,7 +600,6 @@ async function watchBackgroundSubagent(
         } catch {
           child.kill('SIGTERM')
         }
-        // Force kill after 5s if still alive
         setTimeout(() => {
           if (!child.killed && child.pid) {
             try {
@@ -674,7 +613,6 @@ async function watchBackgroundSubagent(
     }
     signal.addEventListener('abort', onAbort, { once: true })
 
-    // Exit handler
     child.on('exit', (code) => {
       if (timer) clearTimeout(timer)
       clearInterval(pollInterval)
@@ -696,9 +634,7 @@ async function watchBackgroundSubagent(
       }
 
       runningSubagents.delete(running.id)
-      if (runningSubagents.size === 0) {
-        subagentColumnSurface = null
-      }
+      if (runningSubagents.size === 0) subagentColumnSurface = null
 
       if (running.forkCleanupFile) {
         try {
@@ -721,10 +657,7 @@ async function watchBackgroundSubagent(
 // ── Interactive launch & watch ──
 
 /**
- * Launch an interactive subagent: creates the multiplexer pane, builds the
- * command, and sends it. Returns a RunningSubagent — does NOT poll.
- *
- * Call watchSubagent() on the returned object to observe completion.
+ * Launch an interactive subagent in a multiplexer pane.
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
@@ -733,11 +666,19 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now()
   const id = Math.random().toString(16).slice(2, 10)
-  const cmd = buildSubagentCommand(params, ctx)
 
-  // Create or reuse a multiplexer pane.
-  // Layout: first subagent splits right, subsequent ones split down from
-  // the first subagent's pane (vertical stack in the right column).
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null
+  const effectiveModel = params.model ?? agentDefs?.model
+  const effectiveTools = params.tools ?? agentDefs?.tools
+  const effectiveSkills = params.skills ?? agentDefs?.skills
+  const effectiveThinking = agentDefs?.thinking
+
+  const sessionFile = ctx.sessionManager.getSessionFile()
+  if (!sessionFile) throw new Error('No session file')
+
+  const subagentSessionFile = generateSubagentSessionFile(dirname(sessionFile))
+
+  // Create or reuse a multiplexer pane
   const surfacePreCreated = !!options?.surface
   let surface: string
   if (options?.surface) {
@@ -752,12 +693,88 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, 500))
   }
 
-  // Shell-escape args and env vars for the sendCommand path
-  const escapedArgs = cmd.args.map((a) => shellEscape(a))
-  const envParts = Object.entries(cmd.envVars).map(([k, v]) => `${k}=${shellEscape(v)}`)
+  // Build task message
+  const denySet = resolveDenyTools(agentDefs)
+  const agentType = params.agent ?? params.name
+  const modeHint = agentDefs?.autoExit
+    ? 'Complete your task autonomously.'
+    : 'Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.'
+  const summaryInstruction = agentDefs?.autoExit
+    ? 'Your FINAL assistant message should summarize what you accomplished.'
+    : 'Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.'
+  const tabTitleInstruction = denySet.has('set_tab_title')
+    ? ''
+    : `As your FIRST action, set the tab title using set_tab_title. ` +
+      `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
+      `Example: "[${agentType}] Analyzing auth module". Keep it concise.`
+  const identity = agentDefs?.body ?? params.systemPrompt ?? null
+  const roleBlock = identity ? `\n\n${identity}` : ''
+  const fullTask = params.fork
+    ? params.task
+    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`
+
+  // Build pi command (shell-escaped for sendCommand)
+  const parts: string[] = ['pi']
+  parts.push('--session', shellEscape(subagentSessionFile))
+
+  let forkCleanupFile: string | undefined
+  if (params.fork) {
+    forkCleanupFile = createForkFile(sessionFile)
+    parts.push('--fork', shellEscape(forkCleanupFile))
+  }
+
+  const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), 'subagent-done.ts')
+  parts.push('-e', shellEscape(subagentDonePath))
+
+  if (effectiveModel) {
+    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel
+    parts.push('--model', shellEscape(model))
+  }
+
+  if (effectiveTools) {
+    const BUILTIN_TOOLS = new Set(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
+    const builtins = effectiveTools
+      .split(',')
+      .map((t) => t.trim())
+      .filter((t) => BUILTIN_TOOLS.has(t))
+    if (builtins.length > 0) parts.push('--tools', shellEscape(builtins.join(',')))
+  }
+
+  if (effectiveSkills) {
+    for (const skill of effectiveSkills
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)) {
+      parts.push(shellEscape(`/skill:${skill}`))
+    }
+  }
+
+  // Env vars (shell-escaped for inline prefix)
+  const envParts: string[] = []
+  if (denySet.size > 0) envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(','))}`)
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`)
+  if (params.agent) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`)
+  if (agentDefs?.autoExit) envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`)
   const envPrefix = envParts.join(' ') + ' '
-  const cdPrefix = cmd.effectiveCwd ? `cd ${shellEscape(cmd.effectiveCwd)} && ` : ''
-  const piCommand = cdPrefix + envPrefix + 'pi ' + escapedArgs.join(' ')
+
+  // Pass task
+  if (params.fork) {
+    parts.push(shellEscape(fullTask))
+  } else {
+    const artifactPath = writeTaskArtifact(params.name, fullTask, ctx)
+    parts.push(`@${artifactPath}`)
+  }
+
+  // Resolve cwd
+  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null
+  const effectiveCwd = rawCwd
+    ? rawCwd.startsWith('/')
+      ? rawCwd
+      : join(process.cwd(), rawCwd)
+    : null
+  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : ''
+
+  const piCommand = cdPrefix + envPrefix + parts.join(' ')
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`
   sendCommand(surface, command)
 
@@ -769,8 +786,8 @@ async function launchSubagent(
     mode: 'interactive',
     surface,
     startTime,
-    sessionFile: cmd.sessionFile,
-    forkCleanupFile: cmd.forkCleanupFile,
+    sessionFile: subagentSessionFile,
+    forkCleanupFile,
   }
 
   runningSubagents.set(id, running)
